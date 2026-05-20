@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "clearread_ocr": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp-server.js"],
+      "env": {
+        "CLEARREAD_OCR_ROOT": "${CLAUDE_PROJECT_DIR}"
+      },
+      "alwaysLoad": true
+    }
+  }
+}

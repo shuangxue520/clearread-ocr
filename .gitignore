@@ -1,0 +1,23 @@
+# Local runtime outputs
+.claude/
+.ocr-output/
+*.sqlite
+*.sqlite3
+*.db
+
+# Local secrets and machine-specific configs
+.env
+.env.*
+*.local.json
+settings.local.json
+
+# Node / Python caches
+node_modules/
+__pycache__/
+*.pyc
+
+# OS/editor noise
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
