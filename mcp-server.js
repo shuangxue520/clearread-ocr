@@ -8,17 +8,21 @@ const zlib = require("zlib");
 const { spawnSync } = require("child_process");
 
 const SERVER_NAME = "clearread_ocr";
-const SERVER_VERSION = "0.2.0";
+const SERVER_VERSION = "0.2.1";
 const ROOT = path.resolve(process.env.CLEARREAD_OCR_ROOT || process.env.CLAUDE_PROJECT_DIR || process.cwd());
 const MAX_FILE_BYTES = 60 * 1024 * 1024;
 const TEXT_EXTENSIONS = new Set([
   ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".jsonl", ".xml", ".html", ".htm",
-  ".log", ".py", ".js", ".jsx", ".ts", ".tsx", ".css", ".scss", ".java", ".c", ".cpp",
-  ".h", ".hpp", ".cs", ".go", ".rs", ".php", ".rb", ".sql", ".yaml", ".yml", ".toml",
-  ".ini", ".ps1", ".bat", ".cmd", ".sh"
+  ".log", ".py", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".vue",
+  ".svelte", ".css", ".scss", ".less", ".java", ".c", ".cpp", ".h", ".hpp", ".cs", ".go",
+  ".rs", ".php", ".rb", ".swift", ".kt", ".kts", ".dart", ".scala", ".r", ".lua", ".pl",
+  ".pm", ".ex", ".exs", ".erl", ".hrl", ".clj", ".cljs", ".fs", ".fsx", ".vb", ".sql",
+  ".yaml", ".yml", ".toml", ".ini", ".env", ".ps1", ".bat", ".cmd", ".sh", ".gradle"
 ]);
+const TEXT_FILENAMES = new Set(["dockerfile", "makefile", "cmakelists.txt", "requirements.txt", "license", "notice", "copying"]);
 const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp"]);
 const OFFICE_EXTENSIONS = new Set([".docx", ".xlsx", ".pptx"]);
+const OPEN_DOCUMENT_EXTENSIONS = new Set([".odt", ".ods", ".odp"]);
 const SKIP_DIRS = new Set([".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", ".next", "target"]);
 
 function write(message) {
@@ -274,6 +278,34 @@ function extractPptx(filePath) {
   return slides.length ? slides.join("\n\n") : "(no slides found in pptx)";
 }
 
+function extractOpenDocument(filePath) {
+  const zip = readZip(filePath);
+  const content = zip.get("content.xml");
+  if (!content) return "(no content.xml found in OpenDocument file)";
+  const xml = content.toString("utf8")
+    .replace(/<text:tab[^>]*\/>/g, "\t")
+    .replace(/<\/text:p>/g, "\n")
+    .replace(/<\/text:h>/g, "\n")
+    .replace(/<\/table:table-row>/g, "\n")
+    .replace(/<\/table:table-cell>/g, "\t");
+  const text = stripXml(xml).replace(/\t+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  return text || "(no readable text found in OpenDocument file)";
+}
+
+function extractRtf(filePath, maxChars) {
+  const raw = fs.readFileSync(filePath, "utf8");
+  const text = raw
+    .replace(/\\par[d]?/g, "\n")
+    .replace(/\\tab/g, "\t")
+    .replace(/\\'[0-9a-fA-F]{2}/g, " ")
+    .replace(/\\[a-zA-Z]+\d* ?/g, "")
+    .replace(/[{}]/g, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return limitText(text || "(no readable text found in rtf)", maxChars);
+}
+
 function run(command, args, timeout = 15000) {
   const result = spawnSync(command, args, {
     cwd: ROOT,
@@ -319,9 +351,15 @@ function extractPdf(filePath) {
     ["python3", ["-c", pyCode, filePath]],
     ["py", ["-3", "-c", pyCode, filePath]]
   ];
+  const errors = [];
   for (const [cmd, args] of candidates) {
     const result = run(cmd, args, 20000);
     if (result.ok && result.output) return `PDF text via ${cmd}:\n${result.output}`;
+    if (result.status === 2 && result.output.includes("NO_PDF_LIBRARY:")) {
+      errors.push(`${cmd}: ${result.output}`);
+      break;
+    }
+    if (result.output) errors.push(`${cmd}: ${result.output}`);
   }
 
   const stat = fs.statSync(filePath);
@@ -329,7 +367,8 @@ function extractPdf(filePath) {
     "PDF text extraction unavailable.",
     `File: ${rel(filePath)}`,
     `Size: ${stat.size} bytes`,
-    "Install pdftotext, pypdf, or PyPDF2 for text extraction."
+    "Install pdftotext, pypdf, or PyPDF2 for text extraction.",
+    errors.length ? `Tried: ${errors.join(" | ")}` : ""
   ].join("\n");
 }
 
@@ -470,6 +509,36 @@ function callConfiguredVision(filePath) {
   return { ok: false, skipped: false, output: errors.join("\n") };
 }
 
+function webpDimensions(buffer) {
+  if (buffer.length < 30 || buffer.toString("ascii", 0, 4) !== "RIFF" || buffer.toString("ascii", 8, 12) !== "WEBP") {
+    return { width: null, height: null };
+  }
+  const signature = buffer.toString("ascii", 12, 16);
+  if (signature === "VP8X" && buffer.length >= 30) {
+    return {
+      width: 1 + buffer.readUIntLE(24, 3),
+      height: 1 + buffer.readUIntLE(27, 3)
+    };
+  }
+  if (signature === "VP8 " && buffer.length >= 30 && buffer[23] === 0x9d && buffer[24] === 0x01 && buffer[25] === 0x2a) {
+    return {
+      width: buffer.readUInt16LE(26) & 0x3fff,
+      height: buffer.readUInt16LE(28) & 0x3fff
+    };
+  }
+  if (signature === "VP8L" && buffer.length >= 25 && buffer[20] === 0x2f) {
+    const b0 = buffer[21];
+    const b1 = buffer[22];
+    const b2 = buffer[23];
+    const b3 = buffer[24];
+    return {
+      width: 1 + (((b1 & 0x3f) << 8) | b0),
+      height: 1 + (((b3 & 0x0f) << 10) | (b2 << 2) | ((b1 & 0xc0) >> 6))
+    };
+  }
+  return { width: null, height: null };
+}
+
 function imageMetadata(filePath) {
   const buffer = fs.readFileSync(filePath);
   const ext = path.extname(filePath).toLowerCase();
@@ -502,11 +571,9 @@ function imageMetadata(filePath) {
     format = "GIF";
   } else if (ext === ".webp" && buffer.length >= 30 && buffer.toString("ascii", 0, 4) === "RIFF") {
     format = "WEBP";
-    const signature = buffer.toString("ascii", 12, 16);
-    if (signature === "VP8X" && buffer.length >= 30) {
-      width = 1 + buffer.readUIntLE(24, 3);
-      height = 1 + buffer.readUIntLE(27, 3);
-    }
+    const dimensions = webpDimensions(buffer);
+    width = dimensions.width;
+    height = dimensions.height;
   }
 
   const parts = [
@@ -517,9 +584,10 @@ function imageMetadata(filePath) {
   ];
 
   const tesseractExe = process.env.TESSERACT_PATH || "tesseract";
-  const tesseract = run(tesseractExe, [filePath, "stdout", "-l", "chi_sim+eng"], 60000);
+  const tesseractLang = process.env.TESSERACT_LANG || "eng";
+  const tesseract = run(tesseractExe, [filePath, "stdout", "-l", tesseractLang], 60000);
   if (tesseract.ok && tesseract.output.trim()) {
-    parts.push("", "--- OCR text (tesseract chi_sim+eng) ---", tesseract.output.trim());
+    parts.push("", `--- OCR text (tesseract ${tesseractLang}) ---`, tesseract.output.trim());
   } else {
     parts.push("", `OCR: ${tesseract.ok ? "no text found" : tesseract.output || "tesseract unavailable"}`);
   }
@@ -536,10 +604,13 @@ function imageMetadata(filePath) {
 
 function detectKind(filePath) {
   const ext = path.extname(filePath).toLowerCase();
+  const base = path.basename(filePath).toLowerCase();
   if (OFFICE_EXTENSIONS.has(ext)) return ext.slice(1);
+  if (OPEN_DOCUMENT_EXTENSIONS.has(ext)) return ext.slice(1);
   if (IMAGE_EXTENSIONS.has(ext)) return "image";
   if (ext === ".pdf") return "pdf";
-  if (TEXT_EXTENSIONS.has(ext)) return "text";
+  if (ext === ".rtf") return "rtf";
+  if (TEXT_EXTENSIONS.has(ext) || TEXT_FILENAMES.has(base)) return "text";
   return "other";
 }
 
@@ -602,9 +673,11 @@ function extractArtifactText(args = {}) {
   if (ext === ".docx") body = extractDocx(file);
   else if (ext === ".xlsx") body = extractXlsx(file, maxRowsPerSheet);
   else if (ext === ".pptx") body = extractPptx(file);
+  else if (OPEN_DOCUMENT_EXTENSIONS.has(ext)) body = extractOpenDocument(file);
   else if (ext === ".pdf") body = extractPdf(file);
+  else if (ext === ".rtf") body = extractRtf(file, maxChars);
   else if (IMAGE_EXTENSIONS.has(ext)) body = imageMetadata(file);
-  else if (TEXT_EXTENSIONS.has(ext)) body = readTextFile(file, maxChars);
+  else if (TEXT_EXTENSIONS.has(ext) || TEXT_FILENAMES.has(path.basename(file).toLowerCase())) body = readTextFile(file, maxChars);
   else body = `Unsupported file type for extraction: ${ext || "(none)"}\nFile: ${rel(file)}\nSize: ${stat.size} bytes`;
 
   return [
@@ -658,7 +731,7 @@ const tools = [
   },
   {
     name: "extract_artifact_text",
-    description: "Extract text or metadata from DOCX, XLSX, PPTX, PDF, text/CSV/JSON/source files, or images.",
+    description: "Extract text or metadata from Office/OpenDocument/RTF/PDF, text/CSV/JSON/source files, or images.",
     inputSchema: {
       type: "object",
       properties: {

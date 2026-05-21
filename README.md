@@ -7,7 +7,7 @@ This plugin gives text-only or limited-vision model backends a practical way to 
 ## Features
 
 - Read local images and screenshots with metadata plus Tesseract OCR.
-- Extract text from DOCX, XLSX, PPTX, PDF, CSV, JSON, Markdown, logs, and source files.
+- Extract text from DOCX, XLSX, PPTX, OpenDocument, RTF, PDF, CSV, JSON, Markdown, logs, and source files.
 - Build compact context bundles from multiple local files.
 - Keep files local by default. Nothing is sent to a remote API unless you configure a vision fallback.
 - Use a self-configured OpenAI-compatible vision model by setting `VISION_API_KEY`, `VISION_API_URL` or `VISION_BASE_URL`, and `VISION_MODEL`.
@@ -59,6 +59,12 @@ The plugin exposes three MCP tools:
 
 The plugin always tries local extraction first. For images, it tries Tesseract OCR before remote vision.
 
+Tesseract defaults to English OCR. Configure additional languages with `TESSERACT_LANG`:
+
+```powershell
+$env:TESSERACT_LANG="chi_sim+eng"
+```
+
 Remote vision only runs when configured through environment variables.
 
 Configure your own OpenAI-compatible vision endpoint:
@@ -99,6 +105,12 @@ If OCR says Tesseract is unavailable, install Tesseract and make sure `tesseract
 
 ```powershell
 $env:TESSERACT_PATH="<absolute-path-to-tesseract.exe>"
+```
+
+For non-English OCR, install the relevant Tesseract language data and set `TESSERACT_LANG`, for example:
+
+```powershell
+$env:TESSERACT_LANG="chi_sim+eng"
 ```
 
 If a generic vision provider fails, confirm that the endpoint supports OpenAI-compatible `chat/completions` requests with `image_url` data URLs.
