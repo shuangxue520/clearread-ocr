@@ -8,6 +8,7 @@ This plugin gives text-only or limited-vision model backends a practical way to 
 
 - Read local images and screenshots with metadata plus Tesseract OCR.
 - Extract text from DOCX, XLSX, PPTX, OpenDocument, RTF, PDF, CSV, JSON, Markdown, logs, and source files.
+- Decode common text encodings including UTF-8, UTF-16, and GB18030/GBK-style Chinese text when possible.
 - Build compact context bundles from multiple local files.
 - Keep files local by default. Nothing is sent to a remote API unless you configure a vision fallback.
 - Use a self-configured OpenAI-compatible vision model by setting `VISION_API_KEY`, `VISION_API_URL` or `VISION_BASE_URL`, and `VISION_MODEL`.
@@ -55,6 +56,16 @@ The plugin exposes three MCP tools:
 - `extract_artifact_text`: extract text, metadata, OCR, or vision output from one file.
 - `make_context_bundle`: combine extracted content from several files for a text-only model.
 
+## Command Line Checks
+
+The MCP server is normally started by Claude Code, but these commands are useful when debugging:
+
+```powershell
+node mcp-server.js --version
+node mcp-server.js --help
+node mcp-server.js --self-test
+```
+
 ## Vision Fallback
 
 The plugin always tries local extraction first. For images, it tries Tesseract OCR before remote vision.
@@ -99,6 +110,13 @@ Images are sent to a remote vision API only when you configure a vision provider
 
 API keys are never stored in this repository. Keep them in your shell, user environment, or secret manager.
 
+## Known Limits
+
+- Scanned or image-only PDFs may not contain extractable text. Export the relevant pages as images and use OCR or a configured vision model.
+- Office extraction focuses on text. Embedded images, SmartArt, charts, macros, comments, tracked changes, and complex formulas may be omitted or flattened.
+- OCR quality depends on the installed Tesseract language data and the clarity of the screenshot or scan.
+- Vision fallback is intentionally opt-in because it sends image content to the provider you configure.
+
 ## Troubleshooting
 
 If OCR says Tesseract is unavailable, install Tesseract and make sure `tesseract` is on `PATH`, or set:
@@ -115,7 +133,7 @@ $env:TESSERACT_LANG="chi_sim+eng"
 
 If a generic vision provider fails, confirm that the endpoint supports OpenAI-compatible `chat/completions` requests with `image_url` data URLs.
 
-If PDF extraction is weak, install `pdftotext` or a Python PDF library such as `pypdf`.
+If PDF extraction is weak, install `pdftotext` or a Python PDF library such as `pypdf`. If the PDF is a scanned document, export pages as images and read those images with OCR or a configured vision model.
 
 ## License
 

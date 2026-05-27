@@ -8,7 +8,7 @@ const zlib = require("zlib");
 const { spawnSync } = require("child_process");
 
 const SERVER_NAME = "clearread_ocr";
-const SERVER_VERSION = "0.2.1";
+const SERVER_VERSION = "0.2.2";
 const ROOT = path.resolve(process.env.CLEARREAD_OCR_ROOT || process.env.CLAUDE_PROJECT_DIR || process.cwd());
 const MAX_FILE_BYTES = 60 * 1024 * 1024;
 const TEXT_EXTENSIONS = new Set([
@@ -51,7 +51,7 @@ function insideRoot(input = ".") {
   const resolved = path.resolve(ROOT, String(input));
   const relative = path.relative(ROOT, resolved);
   if (relative.startsWith("..") || path.isAbsolute(relative)) {
-    throw new Error(`Path is outside project root: ${input}`);
+    throw new Error(`Path '${input}' resolves outside project root '${ROOT}'. Only files within the current Claude project can be read.`);
   }
   return resolved;
 }
@@ -368,6 +368,7 @@ function extractPdf(filePath) {
     `File: ${rel(filePath)}`,
     `Size: ${stat.size} bytes`,
     "Install pdftotext, pypdf, or PyPDF2 for text extraction.",
+    "If this is a scanned or image-only PDF, export the relevant pages as images and read them with OCR or a configured vision model.",
     errors.length ? `Tried: ${errors.join(" | ")}` : ""
   ].join("\n");
 }
@@ -653,11 +654,69 @@ function artifactInventory(args = {}) {
   ].join("\n");
 }
 
+function decodeUtf16Be(buffer, start = 0) {
+  const length = buffer.length - start;
+  const swapped = Buffer.allocUnsafe(length);
+  for (let i = 0; i < length - 1; i += 2) {
+    swapped[i] = buffer[start + i + 1];
+    swapped[i + 1] = buffer[start + i];
+  }
+  if (length % 2) swapped[length - 1] = buffer[buffer.length - 1];
+  return swapped.toString("utf16le");
+}
+
+function guessUtf16(buffer) {
+  const sampleLength = Math.min(buffer.length, 2000);
+  if (sampleLength < 8) return "";
+  let evenZeros = 0;
+  let oddZeros = 0;
+  for (let i = 0; i < sampleLength; i += 1) {
+    if (buffer[i] !== 0) continue;
+    if (i % 2 === 0) evenZeros += 1;
+    else oddZeros += 1;
+  }
+  const pairs = Math.floor(sampleLength / 2);
+  if (oddZeros > pairs * 0.25 && evenZeros < pairs * 0.05) return "utf-16le";
+  if (evenZeros > pairs * 0.25 && oddZeros < pairs * 0.05) return "utf-16be";
+  return "";
+}
+
+function decodeTextBuffer(buffer) {
+  if (buffer.length >= 3 && buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf) {
+    return { text: buffer.subarray(3).toString("utf8"), encoding: "utf-8-bom" };
+  }
+  if (buffer.length >= 2 && buffer[0] === 0xff && buffer[1] === 0xfe) {
+    return { text: buffer.subarray(2).toString("utf16le"), encoding: "utf-16le" };
+  }
+  if (buffer.length >= 2 && buffer[0] === 0xfe && buffer[1] === 0xff) {
+    return { text: decodeUtf16Be(buffer, 2), encoding: "utf-16be" };
+  }
+
+  const guessed = guessUtf16(buffer);
+  if (guessed === "utf-16le") return { text: buffer.toString("utf16le"), encoding: "utf-16le" };
+  if (guessed === "utf-16be") return { text: decodeUtf16Be(buffer), encoding: "utf-16be" };
+
+  const utf8 = buffer.toString("utf8");
+  const replacementCount = (utf8.match(/\uFFFD/g) || []).length;
+  if (replacementCount === 0) return { text: utf8, encoding: "utf-8" };
+
+  if (typeof TextDecoder !== "undefined") {
+    try {
+      const decoded = new TextDecoder("gb18030", { fatal: true }).decode(buffer);
+      return { text: decoded, encoding: "gb18030" };
+    } catch {
+      // Fall back to UTF-8 below so extraction still returns something useful.
+    }
+  }
+  return { text: utf8, encoding: "utf-8-with-replacement" };
+}
+
 function readTextFile(filePath, maxChars) {
   const stat = fs.statSync(filePath);
   if (stat.size > MAX_FILE_BYTES) throw new Error("text file is too large");
-  const text = fs.readFileSync(filePath, "utf8");
-  return limitText(text, maxChars);
+  const decoded = decodeTextBuffer(fs.readFileSync(filePath));
+  const prefix = decoded.encoding === "utf-8" ? "" : `[decoded as ${decoded.encoding}]\n\n`;
+  return limitText(prefix + decoded.text, maxChars);
 }
 
 function extractArtifactText(args = {}) {
@@ -865,6 +924,15 @@ function officeSelfTest() {
   }
 }
 
+function textDecodingSelfTest() {
+  const utf16le = decodeTextBuffer(Buffer.from([0xff, 0xfe, 0x2d, 0x4e, 0x87, 0x65]));
+  const gb18030 = decodeTextBuffer(Buffer.from([0xd6, 0xd0, 0xce, 0xc4]));
+  return {
+    utf16le: utf16le.text === "\u4e2d\u6587",
+    gb18030: gb18030.text === "\u4e2d\u6587"
+  };
+}
+
 function handle(message) {
   const id = message.id;
   try {
@@ -899,13 +967,45 @@ function selfTest() {
     root: ROOT,
     tools: tools.map((tool) => tool.name),
     officeExtraction: officeSelfTest(),
+    textDecoding: textDecodingSelfTest(),
     inventoryPreview: artifactInventory({ path: ".", maxFiles: 10 }).split("\n").slice(0, 12)
   };
   process.stdout.write(JSON.stringify(report, null, 2) + "\n");
 }
 
+function printVersion() {
+  process.stdout.write(`${SERVER_NAME}@${SERVER_VERSION}\n`);
+}
+
+function printHelp() {
+  process.stdout.write([
+    `${SERVER_NAME}@${SERVER_VERSION}`,
+    "",
+    "Local artifact reader MCP server for Claude Code.",
+    "",
+    "Usage:",
+    "  node mcp-server.js              Start MCP stdio server",
+    "  node mcp-server.js --self-test  Run built-in extraction checks",
+    "  node mcp-server.js --version    Print server version",
+    "  node mcp-server.js --help       Show this help",
+    "",
+    "Environment:",
+    "  CLEARREAD_OCR_ROOT   Root directory allowed for reads",
+    "  TESSERACT_PATH       Optional path to tesseract executable",
+    "  TESSERACT_LANG       OCR languages, for example chi_sim+eng",
+    "  VISION_API_KEY       Optional OpenAI-compatible vision API key",
+    "  VISION_API_URL       Optional full /chat/completions endpoint",
+    "  VISION_BASE_URL      Optional base URL used to build /chat/completions",
+    "  VISION_MODEL         Optional vision model name"
+  ].join("\n") + "\n");
+}
+
 if (process.argv.includes("--self-test")) {
   selfTest();
+} else if (process.argv.includes("--version") || process.argv.includes("-v")) {
+  printVersion();
+} else if (process.argv.includes("--help") || process.argv.includes("-h")) {
+  printHelp();
 } else {
   let buffer = "";
   process.stdin.setEncoding("utf8");
