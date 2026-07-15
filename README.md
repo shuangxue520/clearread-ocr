@@ -1,139 +1,139 @@
 # Clearread OCR
 
-Local OCR and artifact-reading plugin for Claude Code.
+[![Version](https://img.shields.io/badge/version-0.3.0-blue)]()
+[![License](https://img.shields.io/badge/license-MIT-green)]()
 
-This plugin gives text-only or limited-vision model backends a practical way to inspect local screenshots, images, PDFs, Office files, CSV files, logs, and source files through MCP tools.
+Local-first OCR and artifact reading for Claude Code, especially useful with
+text-only or limited-vision model backends.
+
+Clearread exposes three compact MCP tools instead of a large format-specific
+toolset. It extracts readable text locally first and only calls a remote vision
+endpoint when the user explicitly configures one.
 
 ## Features
 
-- Read local images and screenshots with metadata plus Tesseract OCR.
-- Extract text from DOCX, XLSX, PPTX, OpenDocument, RTF, PDF, CSV, JSON, Markdown, logs, and source files.
-- Decode common text encodings including UTF-8, UTF-16, and GB18030/GBK-style Chinese text when possible.
-- Build compact context bundles from multiple local files.
-- Keep files local by default. Nothing is sent to a remote API unless you configure a vision fallback.
-- Use a self-configured OpenAI-compatible vision model by setting `VISION_API_KEY`, `VISION_API_URL` or `VISION_BASE_URL`, and `VISION_MODEL`.
-
-## Requirements
-
-- Claude Code with plugin/MCP support.
-- Node.js 18 or newer on `PATH`.
-- Optional: Tesseract OCR on `PATH`, or set `TESSERACT_PATH`.
-- Optional: `pdftotext`, `pypdf`, or `PyPDF2` for stronger PDF text extraction.
+- Tesseract OCR for local images and screenshots.
+- Text extraction from DOCX, XLSX, PPTX, ODT, ODS, ODP, RTF, PDF, CSV, JSON,
+  Markdown, logs, and common source files.
+- Automatic bounded OCR for scanned or image-only PDFs: 3 pages by default,
+  configurable up to 10.
+- Automatic bounded OCR for supported images embedded in DOCX, XLSX, and PPTX:
+  4 images by default, configurable up to 20.
+- UTF-8, UTF-16, and GB18030/GBK-style text decoding.
+- Compact multi-file context bundles.
+- Optional OpenAI-compatible vision fallback for diagrams, charts, forms, and
+  other content that OCR alone cannot explain.
+- No npm dependencies; Office and OpenDocument parsing uses Node.js standard
+  library APIs.
 
 ## Installation
 
-Clone the repository, then load it as a local Claude Code plugin:
+In Claude Code:
+
+```text
+/plugin marketplace add shuangxue520/clearread-ocr
+/plugin install clearread-ocr@clearread-ocr-marketplace
+/reload-plugins
+```
+
+For local development:
 
 ```powershell
-git clone <your-repo-url> clearread-ocr
+git clone https://github.com/shuangxue520/clearread-ocr.git
 cd clearread-ocr
 claude --plugin-dir .
 ```
 
-Inside Claude Code, check that the MCP server is connected:
+## Requirements
 
-```text
-/mcp
-```
+- Node.js 18 or newer.
+- Claude Code with plugin/MCP support.
+- Tesseract on `PATH`, or `TESSERACT_PATH`, for local image OCR.
+- Optional Poppler (`pdftotext` and `pdftoppm`) for the fastest PDF path.
+- Optional Python PDF libraries (`pypdf` and PyMuPDF) as PDF fallbacks.
 
-## Usage
+On Windows, Clearread can discover Poppler installed through WinGet even when
+Claude Code uses a fixed `PATH`.
 
-Ask Claude Code to inspect a local file:
+## Tools
 
-```text
-Use the OCR plugin to read screenshots/login-error.png
-```
+### `artifact_inventory`
 
-Or ask for an inventory before reading:
+Lists files below a project path with compact type and size information.
 
-```text
-Use the OCR plugin to list the files under ./docs, then read the likely assignment files.
-```
+### `extract_artifact_text`
 
-The plugin exposes three MCP tools:
+Extracts one file. Useful optional arguments include:
 
-- `artifact_inventory`: list local files with rough type classification and sizes.
-- `extract_artifact_text`: extract text, metadata, OCR, or vision output from one file.
-- `make_context_bundle`: combine extracted content from several files for a text-only model.
+- `ocrPdfPages`: enable or disable scan OCR; default `true`.
+- `maxOcrPages`: scan at most 1-10 pages; default `3`.
+- `includeEmbeddedImages`: OCR Office media; default `true`.
+- `maxEmbeddedImages`: process at most 1-20 images; default `4`.
+- `useVision`: use the explicitly configured vision endpoint when local OCR is
+  insufficient.
 
-## Command Line Checks
+### `make_context_bundle`
 
-The MCP server is normally started by Claude Code, but these commands are useful when debugging:
+Combines bounded extraction results from several project files into one
+text-first handoff.
 
-```powershell
-node mcp-server.js --version
-node mcp-server.js --help
-node mcp-server.js --self-test
-```
+## OCR Configuration
 
-## Vision Fallback
-
-The plugin always tries local extraction first. For images, it tries Tesseract OCR before remote vision.
-
-Tesseract defaults to English OCR. Configure additional languages with `TESSERACT_LANG`:
+Tesseract defaults to English. Select installed language packs explicitly when
+needed:
 
 ```powershell
 $env:TESSERACT_LANG="chi_sim+eng"
 ```
 
-Remote vision only runs when configured through environment variables.
-
-Configure your own OpenAI-compatible vision endpoint:
+You can also set an executable directly:
 
 ```powershell
-$env:VISION_API_KEY="your-api-key"
-$env:VISION_API_URL="https://example.com/v1/chat/completions"
-$env:VISION_MODEL="your-vision-model"
+$env:TESSERACT_PATH="<absolute-path-to-tesseract>"
 ```
 
-You can also provide a base URL instead of the full chat completions URL:
+## Optional Vision
 
-```powershell
-$env:VISION_BASE_URL="https://example.com/v1"
-$env:VISION_MODEL="your-vision-model"
-```
+Remote vision is disabled unless all required `VISION_*` values are configured.
+Clearread does not infer a provider from unrelated API-key variables.
 
-Optional tuning:
+Set these environment variables in your shell or secret manager:
 
-```powershell
-$env:VISION_MAX_TOKENS="2048"
-$env:VISION_TIMEOUT_MS="30000"
-$env:VISION_PROMPT="Describe the image and transcribe all visible text."
-$env:VISION_EXTRA_HEADERS='{"HTTP-Referer":"https://example.com"}'
-```
+- `VISION_API_KEY`: the provider credential.
+- `VISION_BASE_URL`: an OpenAI-compatible API base URL.
+- `VISION_MODEL`: the vision-capable model name.
+
+`VISION_API_URL` can be used instead of `VISION_BASE_URL` when you already have
+the full `/chat/completions` endpoint. Optional tuning variables are
+`VISION_MAX_TOKENS`, `VISION_TIMEOUT_MS`, `VISION_PROMPT`, and
+`VISION_EXTRA_HEADERS`.
 
 ## Privacy
 
-By default, this plugin reads files locally and returns text to Claude Code through MCP.
+Files are read inside the active Claude project. Local extraction, Tesseract,
+Poppler, and Python fallbacks do not upload file content. An image is sent to a
+remote endpoint only when `VISION_API_KEY`, `VISION_MODEL`, and a vision URL or
+base URL are explicitly configured and vision is used.
 
-Images are sent to a remote vision API only when you configure a vision provider with environment variables. Do not configure remote vision for private images unless you trust that provider.
-
-API keys are never stored in this repository. Keep them in your shell, user environment, or secret manager.
+API keys are read from the process environment and are never written to the
+repository or included in tool output. See [PRIVACY.md](PRIVACY.md).
 
 ## Known Limits
 
-- Scanned or image-only PDFs may not contain extractable text. Export the relevant pages as images and use OCR or a configured vision model.
-- Office extraction focuses on text. Embedded images, SmartArt, charts, macros, comments, tracked changes, and complex formulas may be omitted or flattened.
-- OCR quality depends on the installed Tesseract language data and the clarity of the screenshot or scan.
-- Vision fallback is intentionally opt-in because it sends image content to the provider you configure.
+- OCR quality depends on scan clarity and installed Tesseract language data.
+- PDF scan OCR is intentionally page-bounded to control latency and context.
+- Office extraction does not fully reproduce SmartArt, macros, tracked changes,
+  complex formulas, or document layout.
+- Vision compatibility depends on the configured endpoint accepting
+  OpenAI-compatible image URL content.
 
-## Troubleshooting
-
-If OCR says Tesseract is unavailable, install Tesseract and make sure `tesseract` is on `PATH`, or set:
-
-```powershell
-$env:TESSERACT_PATH="<absolute-path-to-tesseract.exe>"
-```
-
-For non-English OCR, install the relevant Tesseract language data and set `TESSERACT_LANG`, for example:
+## Development
 
 ```powershell
-$env:TESSERACT_LANG="chi_sim+eng"
+node --check .\mcp-server.js
+node .\mcp-server.js --self-test
+claude plugin validate .
 ```
-
-If a generic vision provider fails, confirm that the endpoint supports OpenAI-compatible `chat/completions` requests with `image_url` data URLs.
-
-If PDF extraction is weak, install `pdftotext` or a Python PDF library such as `pypdf`. If the PDF is a scanned document, export pages as images and read those images with OCR or a configured vision model.
 
 ## License
 

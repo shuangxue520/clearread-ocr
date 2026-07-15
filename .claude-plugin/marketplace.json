@@ -1,0 +1,15 @@
+{
+  "name": "clearread-ocr-marketplace",
+  "description": "Claude Code marketplace for Clearread OCR, a local-first artifact reader for text-only model backends.",
+  "owner": {
+    "name": "Clearread OCR contributors"
+  },
+  "plugins": [
+    {
+      "name": "clearread-ocr",
+      "source": "./",
+      "description": "Extract text from images, scanned PDFs, Office/OpenDocument files, logs, and source files with local OCR and optional explicitly configured vision.",
+      "version": "0.3.0"
+    }
+  ]
+}

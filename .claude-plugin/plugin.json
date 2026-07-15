@@ -1,7 +1,7 @@
 {
   "name": "clearread-ocr",
-  "description": "Local OCR and artifact reader for Claude Code. Gives text-only model backends usable context from images, PDFs, Office files, CSV, logs, and source files.",
-  "version": "0.2.2",
+  "description": "Local-first OCR and artifact reader for Claude Code. Extracts text from images, scanned PDFs, Office/OpenDocument files, logs, and source files, with optional explicitly configured vision.",
+  "version": "0.3.0",
   "author": {
     "name": "Clearread OCR contributors"
   }

@@ -8,7 +8,7 @@ const zlib = require("zlib");
 const { spawnSync } = require("child_process");
 
 const SERVER_NAME = "clearread_ocr";
-const SERVER_VERSION = "0.2.2";
+const SERVER_VERSION = "0.3.0";
 const ROOT = path.resolve(process.env.CLEARREAD_OCR_ROOT || process.env.CLAUDE_PROJECT_DIR || process.cwd());
 const MAX_FILE_BYTES = 60 * 1024 * 1024;
 const TEXT_EXTENSIONS = new Set([
@@ -20,7 +20,7 @@ const TEXT_EXTENSIONS = new Set([
   ".yaml", ".yml", ".toml", ".ini", ".env", ".ps1", ".bat", ".cmd", ".sh", ".gradle"
 ]);
 const TEXT_FILENAMES = new Set(["dockerfile", "makefile", "cmakelists.txt", "requirements.txt", "license", "notice", "copying"]);
-const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp"]);
+const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"]);
 const OFFICE_EXTENSIONS = new Set([".docx", ".xlsx", ".pptx"]);
 const OPEN_DOCUMENT_EXTENSIONS = new Set([".odt", ".ods", ".odp"]);
 const SKIP_DIRS = new Set([".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", ".next", "target"]);
@@ -306,24 +306,159 @@ function extractRtf(filePath, maxChars) {
   return limitText(text || "(no readable text found in rtf)", maxChars);
 }
 
+function resolveInvocation(command, args) {
+  if (process.platform !== "win32") return { command, args };
+  const hasPath = path.isAbsolute(command) || command.includes("\\") || command.includes("/");
+  const candidates = [];
+  if (hasPath) {
+    candidates.push(command);
+  } else {
+    for (const directory of String(process.env.PATH || "").split(path.delimiter).filter(Boolean)) {
+      for (const extension of [".exe", ".com", ".cmd", ".bat", ""]) {
+        candidates.push(path.join(directory.replace(/^"|"$/g, ""), command + extension));
+      }
+    }
+    if (["pdftotext", "pdftoppm", "pdfinfo"].includes(command.toLowerCase())) {
+      const executable = `${command}.exe`;
+      if (process.env.POPPLER_BIN) candidates.push(path.join(process.env.POPPLER_BIN, executable));
+      const packagesRoot = process.env.LOCALAPPDATA
+        ? path.join(process.env.LOCALAPPDATA, "Microsoft", "WinGet", "Packages")
+        : "";
+      try {
+        const packages = fs.readdirSync(packagesRoot, { withFileTypes: true })
+          .filter((entry) => entry.isDirectory() && entry.name.toLowerCase().startsWith("oschwartz10612.poppler_"));
+        for (const pkg of packages) {
+          const packagePath = path.join(packagesRoot, pkg.name);
+          const releases = fs.readdirSync(packagePath, { withFileTypes: true })
+            .filter((entry) => entry.isDirectory() && entry.name.toLowerCase().startsWith("poppler-"))
+            .sort((a, b) => b.name.localeCompare(a.name));
+          for (const release of releases) {
+            candidates.push(path.join(packagePath, release.name, "Library", "bin", executable));
+          }
+        }
+      } catch {
+        // Poppler is optional; normal PATH and Python fallbacks remain available.
+      }
+    }
+  }
+  const resolved = candidates.find((candidate) => fs.existsSync(candidate));
+  if (!resolved) return { command, args };
+  const extension = path.extname(resolved).toLowerCase();
+  if (extension === ".cmd" || extension === ".bat") {
+    return { command: process.env.ComSpec || "cmd.exe", args: ["/d", "/s", "/c", resolved, ...args] };
+  }
+  return { command: resolved, args };
+}
+
 function run(command, args, timeout = 15000) {
-  const result = spawnSync(command, args, {
+  const invocation = resolveInvocation(command, args);
+  const result = spawnSync(invocation.command, invocation.args, {
     cwd: ROOT,
     encoding: "utf8",
     timeout,
     windowsHide: true
   });
   if (result.error) return { ok: false, output: result.error.message };
+  const stdout = String(result.stdout || "");
+  const stderr = String(result.stderr || "");
   return {
     ok: result.status === 0,
-    output: `${result.stdout || ""}${result.stderr || ""}`.trim(),
+    output: `${stdout}${stderr}`.trim(),
+    stdout,
+    stderr,
     status: result.status
   };
 }
 
-function extractPdf(filePath) {
+function pythonCandidates(code, args = []) {
+  return [
+    ...(process.env.PYTHON ? [[process.env.PYTHON, ["-c", code, ...args]]] : []),
+    ["py", ["-3.11", "-c", code, ...args]],
+    ["python", ["-c", code, ...args]],
+    ["python3", ["-c", code, ...args]],
+    ["py", ["-3", "-c", code, ...args]]
+  ];
+}
+
+function pdfTextContent(value) {
+  return String(value || "").replace(/^## page \d+\s*$/gmi, "").trim();
+}
+
+function meaningfulPdfText(value) {
+  return pdfTextContent(value).replace(/\s/g, "").length >= 24;
+}
+
+function tesseractText(filePath, timeout = 60000) {
+  const executable = process.env.TESSERACT_PATH || "tesseract";
+  const language = process.env.TESSERACT_LANG || "eng";
+  const result = run(executable, [filePath, "stdout", "-l", language], timeout);
+  return { ...result, output: result.ok ? String(result.stdout || "").trim() : result.output, language };
+}
+
+function renderPdfPages(filePath, outputDir, maxPages) {
+  const prefix = path.join(outputDir, "page");
+  const poppler = run("pdftoppm", ["-f", "1", "-l", String(maxPages), "-r", "150", "-png", filePath, prefix], 120000);
+  let files = fs.readdirSync(outputDir)
+    .filter((name) => /^page-\d+\.png$/i.test(name))
+    .sort((a, b) => Number(a.match(/(\d+)/)[1]) - Number(b.match(/(\d+)/)[1]))
+    .map((name) => path.join(outputDir, name));
+  if (files.length) return { ok: true, files, via: "pdftoppm" };
+
+  const pyCode = [
+    "import os, sys",
+    "try:",
+    "    import fitz",
+    "except Exception as e:",
+    "    print('NO_PYMUPDF:'+str(e))",
+    "    sys.exit(2)",
+    "source, out_dir, limit = sys.argv[1], sys.argv[2], int(sys.argv[3])",
+    "doc = fitz.open(source)",
+    "count = min(limit, len(doc))",
+    "matrix = fitz.Matrix(150/72, 150/72)",
+    "for i in range(count):",
+    "    pix = doc[i].get_pixmap(matrix=matrix, alpha=False)",
+    "    pix.save(os.path.join(out_dir, f'page-{i+1}.png'))",
+    "print(count)"
+  ].join("\n");
+  const errors = [poppler.output].filter(Boolean);
+  for (const [command, commandArgs] of pythonCandidates(pyCode, [filePath, outputDir, String(maxPages)])) {
+    const result = run(command, commandArgs, 120000);
+    files = fs.readdirSync(outputDir)
+      .filter((name) => /^page-\d+\.png$/i.test(name))
+      .sort((a, b) => Number(a.match(/(\d+)/)[1]) - Number(b.match(/(\d+)/)[1]))
+      .map((name) => path.join(outputDir, name));
+    if (result.ok && files.length) return { ok: true, files, via: `${command} + PyMuPDF` };
+    if (result.output) errors.push(`${command}: ${result.output}`);
+    if (result.status === 2 && result.output.includes("NO_PYMUPDF:")) break;
+  }
+  return { ok: false, files: [], error: errors.filter(Boolean).join(" | ") || "no PDF rasterizer available" };
+}
+
+function extractScannedPdf(filePath, maxPages, useVision) {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "artifact-intake-pdf-"));
+  try {
+    const rendered = renderPdfPages(filePath, tempDir, maxPages);
+    if (!rendered.ok) return { ok: false, text: `Scan OCR unavailable: ${rendered.error}` };
+    const parts = [`PDF scan OCR fallback: ${rendered.files.length} page(s) via ${rendered.via}`];
+    for (let index = 0; index < rendered.files.length; index += 1) {
+      const imagePath = rendered.files[index];
+      const ocr = tesseractText(imagePath, 90000);
+      parts.push("", `## page ${index + 1}`);
+      parts.push(ocr.ok && ocr.output.trim() ? ocr.output.trim() : `(OCR found no text${ocr.ok ? "" : `: ${ocr.output || "tesseract unavailable"}`})`);
+      if (useVision) {
+        const vision = callConfiguredVision(imagePath);
+        if (vision.ok && vision.output) parts.push("", `Vision (${vision.label}):`, vision.output);
+      }
+    }
+    return { ok: true, text: parts.join("\n") };
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+function extractPdf(filePath, options = {}) {
   const pdftotext = run("pdftotext", [filePath, "-"], 20000);
-  if (pdftotext.ok && pdftotext.output) return `PDF text via pdftotext:\n${pdftotext.output}`;
+  if (pdftotext.ok && meaningfulPdfText(pdftotext.output)) return `PDF text via pdftotext:\n${pdftotext.output}`;
 
   const pyCode = [
     "import sys",
@@ -345,21 +480,27 @@ function extractPdf(filePath) {
     "    print(text)"
   ].join("\n");
 
-  const candidates = [
-    ...(process.env.PYTHON ? [[process.env.PYTHON, ["-c", pyCode, filePath]]] : []),
-    ["python", ["-c", pyCode, filePath]],
-    ["python3", ["-c", pyCode, filePath]],
-    ["py", ["-3", "-c", pyCode, filePath]]
-  ];
+  const candidates = pythonCandidates(pyCode, [filePath]);
   const errors = [];
+  let sparseText = pdftotext.ok ? pdfTextContent(pdftotext.output) : "";
   for (const [cmd, args] of candidates) {
     const result = run(cmd, args, 20000);
-    if (result.ok && result.output) return `PDF text via ${cmd}:\n${result.output}`;
+    if (result.ok && meaningfulPdfText(result.output)) return `PDF text via ${cmd}:\n${result.output}`;
+    if (result.ok && result.output && !sparseText) sparseText = pdfTextContent(result.output);
     if (result.status === 2 && result.output.includes("NO_PDF_LIBRARY:")) {
       errors.push(`${cmd}: ${result.output}`);
       break;
     }
     if (result.output) errors.push(`${cmd}: ${result.output}`);
+  }
+
+  if (options.ocrPdfPages !== false) {
+    const scanned = extractScannedPdf(filePath, options.maxOcrPages || 3, Boolean(options.useVision));
+    if (scanned.ok) {
+      const prefix = sparseText.trim() ? `Sparse embedded text was also found:\n${sparseText.trim()}\n\n` : "";
+      return `${prefix}${scanned.text}`;
+    }
+    errors.push(scanned.text);
   }
 
   const stat = fs.statSync(filePath);
@@ -368,7 +509,7 @@ function extractPdf(filePath) {
     `File: ${rel(filePath)}`,
     `Size: ${stat.size} bytes`,
     "Install pdftotext, pypdf, or PyPDF2 for text extraction.",
-    "If this is a scanned or image-only PDF, export the relevant pages as images and read them with OCR or a configured vision model.",
+    "This may be a scanned or image-only PDF. Automatic page OCR was unavailable or disabled.",
     errors.length ? `Tried: ${errors.join(" | ")}` : ""
   ].join("\n");
 }
@@ -540,7 +681,7 @@ function webpDimensions(buffer) {
   return { width: null, height: null };
 }
 
-function imageMetadata(filePath) {
+function imageMetadata(filePath, useVision = true) {
   const buffer = fs.readFileSync(filePath);
   const ext = path.extname(filePath).toLowerCase();
   const stat = fs.statSync(filePath);
@@ -584,23 +725,58 @@ function imageMetadata(filePath) {
     `Dimensions: ${width && height ? `${width}x${height}` : "unknown"}`,
   ];
 
-  const tesseractExe = process.env.TESSERACT_PATH || "tesseract";
-  const tesseractLang = process.env.TESSERACT_LANG || "eng";
-  const tesseract = run(tesseractExe, [filePath, "stdout", "-l", tesseractLang], 60000);
+  const tesseract = tesseractText(filePath, 60000);
   if (tesseract.ok && tesseract.output.trim()) {
-    parts.push("", `--- OCR text (tesseract ${tesseractLang}) ---`, tesseract.output.trim());
+    parts.push("", `--- OCR text (tesseract ${tesseract.language}) ---`, tesseract.output.trim());
   } else {
     parts.push("", `OCR: ${tesseract.ok ? "no text found" : tesseract.output || "tesseract unavailable"}`);
   }
 
-  const vision = callConfiguredVision(filePath);
-  if (vision.ok && vision.output) {
-    parts.push("", `--- Vision (${vision.label}) ---`, vision.output);
-  } else if (!vision.skipped && process.env.VISION_REPORT_ERRORS !== "0") {
-    parts.push("", "--- Vision unavailable ---", vision.output);
+  if (useVision) {
+    const vision = callConfiguredVision(filePath);
+    if (vision.ok && vision.output) {
+      parts.push("", `--- Vision (${vision.label}) ---`, vision.output);
+    } else if (!vision.skipped && process.env.VISION_REPORT_ERRORS !== "0") {
+      parts.push("", "--- Vision unavailable ---", vision.output);
+    }
   }
 
   return parts.join("\n");
+}
+
+function embeddedMediaNames(zip) {
+  return Array.from(zip.keys())
+    .filter((name) => /^(word|ppt|xl)\/media\//i.test(name) && IMAGE_EXTENSIONS.has(path.extname(name).toLowerCase()))
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+}
+
+function extractEmbeddedMedia(filePath, maxImages, useVision) {
+  if (maxImages <= 0) return "";
+  const zip = readZip(filePath);
+  const names = embeddedMediaNames(zip);
+  if (!names.length) return "";
+  const selected = names.slice(0, maxImages);
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "artifact-intake-office-"));
+  try {
+    const parts = [`Embedded media OCR: ${selected.length} of ${names.length} supported image(s)`];
+    for (let index = 0; index < selected.length; index += 1) {
+      const name = selected[index];
+      const extension = path.extname(name).toLowerCase() || ".bin";
+      const tempPath = path.join(tempDir, `image-${index + 1}${extension}`);
+      fs.writeFileSync(tempPath, zip.get(name));
+      const ocr = tesseractText(tempPath, 90000);
+      parts.push("", `## ${name}`);
+      parts.push(ocr.ok && ocr.output.trim() ? ocr.output.trim() : `(OCR found no text${ocr.ok ? "" : `: ${ocr.output || "tesseract unavailable"}`})`);
+      if (useVision) {
+        const vision = callConfiguredVision(tempPath);
+        if (vision.ok && vision.output) parts.push("", `Vision (${vision.label}):`, vision.output);
+      }
+    }
+    if (names.length > selected.length) parts.push("", `[skipped ${names.length - selected.length} additional embedded image(s)]`);
+    return parts.join("\n");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
 }
 
 function detectKind(filePath) {
@@ -724,6 +900,8 @@ function extractArtifactText(args = {}) {
   const file = insideRoot(args.path);
   const maxChars = intArg(args.maxChars, 20000, 1000, 200000);
   const maxRowsPerSheet = intArg(args.maxRowsPerSheet, 30, 1, 200);
+  const maxOcrPages = intArg(args.maxOcrPages, 3, 1, 10);
+  const maxEmbeddedImages = intArg(args.maxEmbeddedImages, 4, 0, 20);
   const stat = fs.statSync(file);
   if (!stat.isFile()) throw new Error("path must be a file");
 
@@ -733,11 +911,20 @@ function extractArtifactText(args = {}) {
   else if (ext === ".xlsx") body = extractXlsx(file, maxRowsPerSheet);
   else if (ext === ".pptx") body = extractPptx(file);
   else if (OPEN_DOCUMENT_EXTENSIONS.has(ext)) body = extractOpenDocument(file);
-  else if (ext === ".pdf") body = extractPdf(file);
+  else if (ext === ".pdf") body = extractPdf(file, {
+    ocrPdfPages: args.ocrPdfPages !== false,
+    maxOcrPages,
+    useVision: args.useVision === true
+  });
   else if (ext === ".rtf") body = extractRtf(file, maxChars);
-  else if (IMAGE_EXTENSIONS.has(ext)) body = imageMetadata(file);
+  else if (IMAGE_EXTENSIONS.has(ext)) body = imageMetadata(file, args.useVision !== false);
   else if (TEXT_EXTENSIONS.has(ext) || TEXT_FILENAMES.has(path.basename(file).toLowerCase())) body = readTextFile(file, maxChars);
   else body = `Unsupported file type for extraction: ${ext || "(none)"}\nFile: ${rel(file)}\nSize: ${stat.size} bytes`;
+
+  if (OFFICE_EXTENSIONS.has(ext) && args.includeEmbeddedImages !== false) {
+    const embedded = extractEmbeddedMedia(file, maxEmbeddedImages, args.useVision === true);
+    if (embedded) body = `${body}\n\n--- Embedded images ---\n${embedded}`;
+  }
 
   return [
     `File: ${rel(file)}`,
@@ -790,13 +977,18 @@ const tools = [
   },
   {
     name: "extract_artifact_text",
-    description: "Extract text or metadata from Office/OpenDocument/RTF/PDF, text/CSV/JSON/source files, or images.",
+    description: "Extract text from Office/OpenDocument/RTF/PDF/text/source files and OCR images. Scanned PDFs and embedded Office images use bounded local OCR fallbacks.",
     inputSchema: {
       type: "object",
       properties: {
         path: { type: "string", description: "Project-relative file path." },
         maxChars: { type: "integer", minimum: 1000, maximum: 200000 },
-        maxRowsPerSheet: { type: "integer", minimum: 1, maximum: 200 }
+        maxRowsPerSheet: { type: "integer", minimum: 1, maximum: 200 },
+        ocrPdfPages: { type: "boolean", description: "OCR scanned/image-only PDF pages when normal text extraction is sparse. Default true." },
+        maxOcrPages: { type: "integer", minimum: 1, maximum: 10, description: "Maximum scanned PDF pages to OCR. Default 3." },
+        includeEmbeddedImages: { type: "boolean", description: "OCR supported images embedded in DOCX/XLSX/PPTX. Default true." },
+        maxEmbeddedImages: { type: "integer", minimum: 0, maximum: 20, description: "Maximum embedded Office images to OCR. Default 4." },
+        useVision: { type: "boolean", description: "Also call configured vision for PDF pages or embedded Office images. Direct image files use vision by default; batch fallbacks default false." }
       },
       required: ["path"],
       additionalProperties: false
@@ -901,8 +1093,10 @@ function officeSelfTest() {
     const xlsx = path.join(tempDir, "sample.xlsx");
     const pptx = path.join(tempDir, "sample.pptx");
 
+    const tinyPng = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
     fs.writeFileSync(docx, makeStoredZip({
-      "word/document.xml": '<w:document xmlns:w="w"><w:body><w:p><w:r><w:t>Hello DOCX</w:t></w:r></w:p></w:body></w:document>'
+      "word/document.xml": '<w:document xmlns:w="w"><w:body><w:p><w:r><w:t>Hello DOCX</w:t></w:r></w:p></w:body></w:document>',
+      "word/media/image1.png": tinyPng
     }));
     fs.writeFileSync(xlsx, makeStoredZip({
       "xl/workbook.xml": '<workbook xmlns:r="r"><sheets><sheet name="Sheet One" sheetId="1" r:id="rId1"/></sheets></workbook>',
@@ -917,7 +1111,8 @@ function officeSelfTest() {
     return {
       docx: extractDocx(docx).includes("Hello DOCX"),
       xlsx: extractXlsx(xlsx, 10).includes("Ada"),
-      pptx: extractPptx(pptx).includes("Hello PPTX")
+      pptx: extractPptx(pptx).includes("Hello PPTX"),
+      embeddedMedia: embeddedMediaNames(readZip(docx)).includes("word/media/image1.png")
     };
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
@@ -962,12 +1157,14 @@ function handle(message) {
 }
 
 function selfTest() {
+  const poppler = run("pdftotext", ["-v"], 5000);
   const report = {
     server: `${SERVER_NAME}@${SERVER_VERSION}`,
     root: ROOT,
     tools: tools.map((tool) => tool.name),
     officeExtraction: officeSelfTest(),
     textDecoding: textDecodingSelfTest(),
+    popplerAvailable: poppler.ok,
     inventoryPreview: artifactInventory({ path: ".", maxFiles: 10 }).split("\n").slice(0, 12)
   };
   process.stdout.write(JSON.stringify(report, null, 2) + "\n");
@@ -990,7 +1187,7 @@ function printHelp() {
     "  node mcp-server.js --help       Show this help",
     "",
     "Environment:",
-    "  CLEARREAD_OCR_ROOT   Root directory allowed for reads",
+    "  ARTIFACT_INTAKE_ROOT Root directory allowed for reads",
     "  TESSERACT_PATH       Optional path to tesseract executable",
     "  TESSERACT_LANG       OCR languages, for example chi_sim+eng",
     "  VISION_API_KEY       Optional OpenAI-compatible vision API key",
